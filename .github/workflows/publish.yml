@@ -1,0 +1,141 @@
+# copier-sync-action-repo/.github/workflows/publish.yml
+name: publish-branch
+
+permissions:
+  pull-requests: write
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_slug:
+        description: "Select the repository"
+        required: true
+        type: string
+      source_branch:
+        required: true
+        type: string
+        default: main
+      dest_branch:
+        required: true
+        type: string
+      create_pr:
+        description: "Create a PR from dest_branch to main in the fork"
+        required: false
+        default: false
+        type: boolean
+      sync_strategy:
+        description: "How to bring internal/<source_branch> up to date with upstream"
+        required: false
+        type: choice
+        options: [rebase, merge]
+        default: rebase
+
+  workflow_call:
+    inputs:
+      repo_slug:      { required: true,  type: string }
+      source_branch:  { required: true,  type: string }
+      dest_branch:    { required: true,  type: string }
+      create_pr:      { required: false, type: boolean }
+      sync_strategy:  { required: false, type: string, default: rebase }
+    secrets:
+      GH_APP_ID:          { required: true }
+      GH_APP_PRIVATE_KEY: { required: true }
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 0. Compute repo names from the slug -------------------------------
+      - name: Derive repo names
+        id: names
+        run: |
+          echo "internal=${{ inputs.repo_slug }}_internal"         >>"$GITHUB_OUTPUT"
+          echo "fork=${{ inputs.repo_slug }}"                      >>"$GITHUB_OUTPUT"
+          echo "upstream=nicu1989/${{ inputs.repo_slug }}"    >>"$GITHUB_OUTPUT"
+
+      # 1. App token -------------------------------------------------------
+      - name: Generate GitHub App token
+        id: generate_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id:      ${{ secrets.GH_APP_ID }}
+          private_key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+
+      # 2. Git credentials (NO hard-coded user) ---------------------------
+      - name: Configure Git credentials
+        run: |
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ steps.generate_token.outputs.token }}@github.com" > ~/.git-credentials
+
+      # 3. Checkout internal repo -----------------------------------------
+      - uses: actions/checkout@v3
+        with:
+          repository:        nicu1989/${{ steps.names.outputs.internal }}
+          fetch-depth:       0
+          token:             ${{ steps.generate_token.outputs.token }}
+          path:              internal
+
+      # 4. Add remotes -----------------------------------------------------
+      - name: Add remotes
+        working-directory: internal
+        run: |
+          git remote add upstream https://github.com/${{ steps.names.outputs.upstream }}.git
+          git remote add fork     https://github.com/nicu1989/${{ steps.names.outputs.fork }}.git
+
+      # 5. Sync internal branch with upstream ------------------------------
+      - name: Sync internal branch with upstream
+        working-directory: internal
+        run: |
+          git fetch upstream
+          git checkout "${{ inputs.source_branch }}"
+
+          case "${{ inputs.sync_strategy || 'rebase' }}" in
+            rebase)
+              git rebase "upstream/main"
+              ;;
+            merge)
+              git merge --no-ff "upstream/main"
+              ;;
+            *)
+              echo "::error::Unknown sync_strategy" && exit 1
+              ;;
+          esac
+
+      # 6. *** Rewrite committer = author for EVERY commit ***
+      - name: Rewrite committer = author
+        working-directory: internal
+        run: |
+          git rebase --exec '
+            export GIT_COMMITTER_NAME="$(git show -s --format=%an)"
+            export GIT_COMMITTER_EMAIL="$(git show -s --format=%ae)"
+            git commit --amend --no-edit --reset-author
+          ' --committer-date-is-author-date upstream/main
+
+      # 7. Push branch to fork ---------------------------------------------
+      - name: Push branch to fork
+        working-directory: internal
+        run: |
+          git checkout -B "${{ inputs.dest_branch }}"
+          git push fork HEAD:${{ inputs.dest_branch }} --force
+
+      # 8. Verify push ------------------------------------------------------
+      - name: Verify branch pushed
+        working-directory: internal
+        run: |
+          git ls-remote fork "refs/heads/${{ inputs.dest_branch }}"
+
+      # 9. Optionally create draft PR --------------------------------------
+      - name: Create Draft Pull Request in fork
+        if: ${{ inputs.create_pr }}
+        run: |
+          gh pr create \
+            --repo nicu1989/${{ inputs.repo_slug }} \
+            --base main \
+            --head nicu1989:${{ inputs.dest_branch }} \
+            --title "Sync: ${{ inputs.dest_branch }}" \
+            --body  "Automated draft PR from ${{ inputs.source_branch }}. Please update this message" \
+            --draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
