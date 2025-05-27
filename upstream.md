@@ -7,3 +7,5 @@ commit 2
 internal commit
 
 another internal commit
+
+third internal commit
